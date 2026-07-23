@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.device import utils as device_utils
@@ -44,6 +45,8 @@ else:
 
 
 class BaseDeviceAdaptor:
+    _logged_dsa_flat_scatter = False
+    _logged_dsa_slot_mapping_2d_to_flat = False
 
     @staticmethod
     def compute_gate_logits(
@@ -616,6 +619,15 @@ class BaseDeviceAdaptor:
             return
 
         cache_2d, x_2d = flat_inputs
+        if not BaseDeviceAdaptor._logged_dsa_flat_scatter:
+            logger.info(
+                "DSA KV scatter uses flat row-update path: cache=%s, "
+                "slot_mapping=%s, update=%s",
+                tuple(cache_2d.shape),
+                tuple(slot_mapping_2d.shape),
+                tuple(x_2d.shape),
+            )
+            BaseDeviceAdaptor._logged_dsa_flat_scatter = True
         torch.ops._C_ascend.npu_scatter_nd_update_v2(cache_2d, slot_mapping_2d, x_2d)
 
     # ===== Indexer Quant + Scatter =====
@@ -755,6 +767,14 @@ class BaseDeviceAdaptor:
             if slot_mapping.shape[-1] == 1:
                 return slot_mapping.view(-1)
             if slot_mapping.shape[-1] == 2:
+                if not BaseDeviceAdaptor._logged_dsa_slot_mapping_2d_to_flat:
+                    logger.info(
+                        "DSA slot_mapping converts block-offset to flat ids: "
+                        "slot_mapping=%s, block_size=%s",
+                        tuple(slot_mapping.shape),
+                        block_size,
+                    )
+                    BaseDeviceAdaptor._logged_dsa_slot_mapping_2d_to_flat = True
                 return slot_mapping[:, 0] * block_size + slot_mapping[:, 1]
         return slot_mapping
 
