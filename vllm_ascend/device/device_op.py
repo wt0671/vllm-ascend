@@ -587,14 +587,36 @@ class BaseDeviceAdaptor:
     @staticmethod
     def get_dsa_compressor_slot_mapping_format():
         """Slot mapping side output format consumed by the DSA scatter op."""
-        return DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET
+        return DSA_COMPRESSOR_SLOT_MAPPING_FLAT
 
     # ===== SWA / Compressor KV Scatter =====
 
     @staticmethod
+    def _flatten_dsa_kv_scatter_inputs(cache, x):
+        """Convert DSA cache/update tensors to flat row-update tensors."""
+        if not cache.is_contiguous() or cache.shape[-1] != x.shape[-1]:
+            return None
+
+        return (cache.view(-1, cache.shape[-1]),
+                x.reshape(-1, cache.shape[-1]))
+
+    @staticmethod
     def dsa_kv_compress_scatter(cache, x, slot_mapping):
         """Scatter KV into cache. Non-A5: simple scatter of pre-quantized tensor."""
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)
+        flat_inputs = BaseDeviceAdaptor._flatten_dsa_kv_scatter_inputs(cache, x)
+        if slot_mapping.dim() == 1:
+            slot_mapping_2d = slot_mapping.view(-1, 1)
+        elif slot_mapping.dim() == 2 and slot_mapping.shape[-1] == 1:
+            slot_mapping_2d = slot_mapping
+        else:
+            slot_mapping_2d = None
+
+        if flat_inputs is None or slot_mapping_2d is None:
+            torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)
+            return
+
+        cache_2d, x_2d = flat_inputs
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(cache_2d, slot_mapping_2d, x_2d)
 
     # ===== Indexer Quant + Scatter =====
 
@@ -728,8 +750,13 @@ class BaseDeviceAdaptor:
     @staticmethod
     def format_dsa_slot_mapping(slot_mapping, block_size):
         """Format slot_mapping for metadata storage.
-        Non-A5: 2D [block_idx, offset]; A5: 1D pass-through."""
-        return torch.stack([slot_mapping // block_size, slot_mapping % block_size], axis=-1)
+        Non-A5: 1D flat row ids for 2D row-update scatter."""
+        if slot_mapping.dim() == 2:
+            if slot_mapping.shape[-1] == 1:
+                return slot_mapping.view(-1)
+            if slot_mapping.shape[-1] == 2:
+                return slot_mapping[:, 0] * block_size + slot_mapping[:, 1]
+        return slot_mapping
 
     @staticmethod
     def get_dsa_decode_cu_seqlens_cmp_kv(cmp_kv_tensor):
