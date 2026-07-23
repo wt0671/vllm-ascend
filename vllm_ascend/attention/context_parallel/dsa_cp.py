@@ -88,6 +88,20 @@ def _rms_norm_dynamic_mx_quant(
     return out[0], out[1]
 
 
+def _format_dsa_slot_mapping_for_storage(
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    target_slot_mapping: torch.Tensor,
+) -> torch.Tensor:
+    formatted = DeviceOperator.format_dsa_slot_mapping(slot_mapping, block_size)
+    if target_slot_mapping.dim() == 1 and formatted.dim() == 2:
+        if formatted.shape[-1] == 1:
+            return formatted.view(-1)
+        if formatted.shape[-1] == 2:
+            return formatted[:, 0] * block_size + formatted[:, 1]
+    return formatted
+
+
 @dataclass
 class DSACPMetadata:
     """Context-parallel metadata for sequence-sharded DSA execution."""
@@ -360,7 +374,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.seq_lens_cpu = self.common_ratio_to_sas_metadata["seq_lens_cpu"]
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.slot_mapping[:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(slot_mapping, self.block_size)
+        self.slot_mapping[:num_input_tokens] = _format_dsa_slot_mapping_for_storage(
+            slot_mapping, self.block_size, self.slot_mapping
+        )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
 
@@ -417,8 +433,10 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
 
         assert self.spec_slot_mapping is not None
-        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(
-            slot_mapping, self.block_size
+        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = _format_dsa_slot_mapping_for_storage(
+            slot_mapping,
+            self.block_size,
+            self.spec_slot_mapping[draft_index - 1],
         )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]

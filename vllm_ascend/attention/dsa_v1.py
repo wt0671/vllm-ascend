@@ -154,6 +154,20 @@ def _rms_norm_dynamic_mx_quant(
     return out[0], out[1]
 
 
+def _format_dsa_slot_mapping_for_storage(
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    target_slot_mapping: torch.Tensor,
+) -> torch.Tensor:
+    formatted = DeviceOperator.format_dsa_slot_mapping(slot_mapping, block_size)
+    if target_slot_mapping.dim() == 1 and formatted.dim() == 2:
+        if formatted.shape[-1] == 1:
+            return formatted.view(-1)
+        if formatted.shape[-1] == 2:
+            return formatted[:, 0] * block_size + formatted[:, 1]
+    return formatted
+
+
 def pad_to_blocks(x: torch.Tensor, length_list: torch.Tensor, block_size: int = 128):
     """
     Pads a ragged/packed tensor into fixed-size blocks.
@@ -637,7 +651,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         # NOTE: Currently, MTP-fullgraph is incompatibility pcp
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.slot_mapping[:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(slot_mapping, self.block_size)
+        self.slot_mapping[:num_input_tokens] = _format_dsa_slot_mapping_for_storage(
+            slot_mapping, self.block_size, self.slot_mapping
+        )
 
         self.graph_pad_size = common_attn_metadata.graph_pad_size
         block_table_size = self.get_block_table_size(common_attn_metadata, BUILD_METADATA_STEP_PREFILL)
@@ -1150,8 +1166,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True, draft_index=draft_index)
 
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = DeviceOperator.format_dsa_slot_mapping(  # type: ignore[index]
-            slot_mapping, self.block_size
+        self.spec_slot_mapping[draft_index - 1][:num_input_tokens] = _format_dsa_slot_mapping_for_storage(  # type: ignore[index]
+            slot_mapping,
+            self.block_size,
+            self.spec_slot_mapping[draft_index - 1],  # type: ignore[index]
         )
 
         prefill_metadata = None
