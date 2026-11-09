@@ -8,7 +8,7 @@ import unittest
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -33,18 +33,13 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         self.ns = load(
             "vllm_ascend/compilation/kimi_moe_superkernel.py",
             {
-                "collect_moe_superkernel_scopes",
                 "moe_superkernel_scope",
                 "moe_superkernel_options",
-                "optimize_moe_superkernel",
                 "use_kimi_moe_superkernel",
             },
             dict(
                 contextmanager=contextmanager,
                 torch=NS(npu=self.npu),
-                logger=Mock(),
-                get_forward_context=lambda: self.context,
-                _CAPTURE_SCOPES_KEY="scopes",
                 _is_kimi_moe_model=lambda vc: vc.kimi,
                 get_current_hardware_profile=lambda: NS(supports=lambda cap: True),
                 HardwareCapability=NS(CANN_MEGAMOE_MXFP=1),
@@ -67,11 +62,10 @@ class TestKimiMoESuperkernel(unittest.TestCase):
             self.assertFalse(select(vc, cfg))
             setattr(obj, key, old)
 
-    def test_nested_scope_and_failure_cleanup(self):
-        collect, scope = self.ns["collect_moe_superkernel_scopes"], self.ns["moe_superkernel_scope"]
-        with collect(self.context, True) as outer, scope("outer", True):
+    def test_named_and_excluded_scopes_are_balanced_on_failure(self):
+        scope = self.ns["moe_superkernel_scope"]
+        with scope("outer", True):
             with (
-                collect(self.context, True) as inner,
                 self.assertRaisesRegex(RuntimeError, "kernel"),
                 scope("inner", True),
                 scope(None, True),
@@ -79,9 +73,9 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 raise RuntimeError("kernel")
             with scope("restored", True):
                 pass
-        self.assertEqual(outer, {"outer", "restored"})
-        self.assertEqual(inner, {"inner"})
-        self.assertEqual(self.context.additional_kwargs, {})
+        expected = [call("outer"), call("inner"), call(None), call("restored")]
+        self.assertEqual(self.npu.super_kernel_scope_begin.call_args_list, expected)
+        self.assertEqual(self.npu.super_kernel_scope_end.call_args_list, expected)
         self.assertEqual(self.npu.super_kernel_scope_begin.call_count, self.npu.super_kernel_scope_end.call_count)
 
     def test_runtime_scope_covers_projections_but_excludes_final_add(self):
@@ -183,7 +177,7 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "legacy"):
             ns["_configure_backend"](object(), cfg, vc)
 
-    def test_acl_capture_optimizes_once_and_skips_draft_or_unmarked(self):
+    def test_acl_capture_does_not_run_extra_post_capture_optimization(self):
         for enabled, marked, draft in (
             (True, True, False),
             (True, False, False),
@@ -195,7 +189,6 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 self.context.batch_descriptor = "batch"
                 self.context.cudagraph_runtime_mode = "full"
                 graph = Mock()
-                graph.super_kernel_optimize.side_effect = lambda order=order, **kw: order.append("optimize")
                 graph.replay.side_effect = lambda order=order: order.append("replay")
 
                 @contextmanager
@@ -248,15 +241,8 @@ class TestKimiMoESuperkernel(unittest.TestCase):
                 with patch.dict(sys.modules, {"vllm.model_executor.offloader.base": NS(get_offloader=lambda: Mock())}):
                     self.assertEqual(ns["__call__"](wrapper), "result")
                     self.assertEqual(ns["__call__"](wrapper), "result")
-                expected = ["begin", "forward", "end"]
-                if enabled and marked and not draft:
-                    expected.append("optimize")
-                    graph.super_kernel_optimize.assert_called_once_with(
-                        optimize_options=self.ns["moe_superkernel_options"]()
-                    )
-                else:
-                    graph.super_kernel_optimize.assert_not_called()
-                self.assertEqual(order, expected + ["replay"])
+                graph.super_kernel_optimize.assert_not_called()
+                self.assertEqual(order, ["begin", "forward", "end", "replay"])
                 self.assertEqual(self.context.additional_kwargs, {})
 
     def test_draft_mark_precedes_upstream_validation_and_restores_target(self):
